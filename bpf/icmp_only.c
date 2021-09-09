@@ -93,11 +93,6 @@ BPF_MAP_DEF(if_mac_map) = {
 };
 BPF_MAP_ADD(if_mac_map);
 
-// BPF_MAP_DEF(nat_table) = {
-// 	
-// };
-// BPF_MAP_ADD(nat_table);
-
 static inline __u16 ntohs(__u16 val) {
 	return (val << 8) + (val >> 8);
 }
