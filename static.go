@@ -15,6 +15,7 @@ type static struct {
 	ifIndexMap goebpf.Map
 	ifAddrMap goebpf.Map
 	ifMacMap goebpf.Map
+	natTable goebpf.Map
 	program goebpf.Program
 }
 
@@ -77,6 +78,10 @@ func newStaticNat(natMap staticNatMap) (*static, error) {
 	st.ifMacMap = st.bpf.GetMapByName("if_mac_map")
 	if st.ifMacMap == nil {
 		return nil, fmt.Errorf("failed to get bpf map: if_mac_map")
+	}
+	st.natTable = st.bpf.GetMapByName("nat_table")
+	if st.natTable == nil {
+		return nil, fmt.Errorf("failed to get bpf map: nat_table")
 	}
 	if err := st.program.Load(); err != nil {
 		return nil, err
@@ -142,6 +147,5 @@ func (s *static) Prepare() error {
 }
 
 func (s *static) Run() error {
-
-	return nil
+	for {}
 }

@@ -37,6 +37,14 @@ BPF_MAP_DEF(if_mac_map) = {
 };
 BPF_MAP_ADD(if_mac_map);
 
+BPF_MAP_DEF(nat_table) = {
+	.map_type = BPF_MAP_TYPE_HASH,
+	.key_size = sizeof(__u16),
+	.value_size = sizeof(__u16),
+	.max_entries = 128,
+};
+BPF_MAP_ADD(nat_table);
+
 static inline __u16 ntohs(__u16 val) {
 	return (val << 8) + (val >> 8);
 }
@@ -69,7 +77,6 @@ int nat_prog(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
     void *data = (void *)(long)ctx->data;
 	__u32 ingress_ifindex = ctx->ingress_ifindex;
-	bpf_printk("ingress interface index is %d", ingress_ifindex);
 
 	// get map data
 	__u32 in_key = 0;
@@ -80,7 +87,6 @@ int nat_prog(struct xdp_md *ctx) {
 		bpf_printk("failed to get interface index. pass.");
 		return XDP_PASS;
 	}
-	bpf_printk("interface in = %d out = %d", *in_ifindex, *out_ifindex);
 	__u32 *in_addr = bpf_map_lookup_elem(&if_addr_map, in_ifindex);
 	__u32 *out_addr = bpf_map_lookup_elem(&if_addr_map, out_ifindex);
 	if (!in_addr || !out_addr ) {
@@ -113,7 +119,6 @@ int nat_prog(struct xdp_md *ctx) {
 			return XDP_PASS;
 		}
 		if (ingress_ifindex != *in_ifindex) {
-			bpf_printk("arp egress interface packet");
 			return XDP_PASS;
 		}
 		if (arp->ar_hrd != 0x0100 || arp->ar_pro != 0x08) {
@@ -136,11 +141,11 @@ int nat_prog(struct xdp_md *ctx) {
 
 		memcpy(ether->h_dest, arp->ar_dha, ETH_ALEN);
 		memcpy(ether->h_source, in_mac, ETH_ALEN);
-		bpf_printk("proxy arp sent.");
 
 		return XDP_TX;
-		
 	}
+	
+	// ip packet handle
 	if (ether->h_proto != 0x08U) {
 		return XDP_PASS;
 	}
@@ -150,10 +155,13 @@ int nat_prog(struct xdp_md *ctx) {
 		return XDP_PASS;
 	}
 	data += ip->ihl * 4;
-	// look up route talble
 
-	// handle packet
+	// handle packet from ingress interface.
 	if (ingress_ifindex == *in_ifindex) {
+		//if (ip->daddr == *in_addr) {
+		//	bpf_printk("destination is local interface.");
+		//	return XDP_PASS;
+		//}
 		struct bpf_fib_lookup fib_params;
 		__builtin_memset(&fib_params, 0, sizeof(fib_params));
 		fib_params.family = AF_INET;
@@ -181,14 +189,26 @@ int nat_prog(struct xdp_md *ctx) {
 				if (data + sizeof(*echo) > data_end) {
 					return XDP_PASS;
 				}
+				// update static nat table
+				__u16 ident = echo->ident;
+				__u16 *exist = bpf_map_lookup_elem(&nat_table, &ident);
+				if (!exist) {
+					if (bpf_map_update_elem(&nat_table, &ident, &ident, 0) != 0) {
+						bpf_printk("failed: bpf_map_update_elem()");
+						return XDP_PASS;
+					}
+					bpf_printk("register %d", ident);
+				} else {
+					bpf_printk("%d is already registered", ident);
+				}
+				
 			}
 			ip->saddr = *out_addr;
-			//ip->saddr = htonl(*out_addr);
 			ip->check = 0;
 			ip->check = checksum((__u16 *)ip, sizeof(*ip));
 			memcpy(ether->h_dest, fib_params.dmac, ETH_ALEN);
 			memcpy(ether->h_source, fib_params.smac, ETH_ALEN);
-			bpf_printk("icmp nat to %d", ip->daddr);
+
 			
 			return bpf_redirect_map(&if_redirect, *out_ifindex, 0);
 		} 
@@ -216,7 +236,13 @@ int nat_prog(struct xdp_md *ctx) {
 			pseudo.len = ip->tot_len - (ip->ihl * 4);
 		}
 	} else if (ingress_ifindex == *out_ifindex) {
-		bpf_printk("egress packet handle");
+
+
+		//ip->daddr = *mapped_local_addr;
+		//ip->check = 0;
+		//ip->check = checksum((__u16 *)ip, sizeof(*ip));
+
+
 		if (ip->protocol == 0x01) {
 			// icmp
 			struct icmphdr *icmp = data;
@@ -229,7 +255,15 @@ int nat_prog(struct xdp_md *ctx) {
 				if (data + sizeof(*echo) > data_end) {
 					return XDP_PASS;
 				}
+				__u16 ident = echo->ident;
+				__u16 *registered_ident = bpf_map_lookup_elem(&nat_table, &ident);
+				if (!registered_ident) {
+					bpf_printk("icmp echo identifier is not registerd.");
+					return XDP_PASS;
+				}
+				bpf_printk("registered ident = %d", *registered_ident);
 			}
+
 			ip->daddr = *mapped_local_addr;
 			ip->check = 0;
 			ip->check = checksum((__u16 *)ip, sizeof(*ip));
@@ -282,7 +316,6 @@ int nat_prog(struct xdp_md *ctx) {
 			return XDP_PASS;
 		}
 	} else {
-		bpf_printk("unknown interface");
 		return XDP_PASS;
 	}
 	return XDP_PASS;
