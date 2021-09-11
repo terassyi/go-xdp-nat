@@ -4,11 +4,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
-
-	"github.com/dropbox/goebpf"
 )
 
-var NAT_TYPE_LIST []string = []string{"icmp_only"}
+const (
+	STATIC_ELF string = "bpf/static.elf"
+)
 
 func main() {
 	var natType, in, out, inAddr, outAddr, mapedAddr string
@@ -20,60 +20,31 @@ func main() {
 	flag.StringVar(&mapedAddr, "maped", "", "static maped local address.")
 	flag.Parse()
 
-	typ, err := NewNatType(natType)
-	if err != nil {
-		fmt.Println("Please specify NAT type: ", err)
+	typ := NewNatType(natType)
+	if typ == UNKNOWN {
+		fmt.Println("Please specify NAT type.")
 		os.Exit(1)
 	}
 
-	nat, err := newNat(typ, in, out, inAddr, outAddr, mapedAddr)
-	if err != nil {
-		fmt.Println("NAT configuration error: ", err)
-		os.Exit(1)
-	}
+	switch typ {
+	case STATIC:
+		sMap, err := newStaticNatMap(in, out, inAddr, outAddr, mapedAddr, STATIC_ELF)
+		if err != nil {
+			panic(err)
+		}
+		sNat, err := newStaticNat(*sMap)
+		if err != nil {
+			panic(err)
+		}
+		if err := sNat.Attach(); err != nil {
+			panic(err)
+		}
+		defer sNat.Detach()
+		if err := sNat.Prepare(); err != nil {
+			panic(err)
+		}
 
-	fmt.Println("--- NAT by Golang + XDP ---")
-	showIfaceInfo(nat.in)
-	showIfaceInfo(nat.out)
-
-	bpf := goebpf.NewDefaultEbpfSystem()
-	if err := bpf.LoadElf("bpf/" + nat.typ.String() + ".elf"); err != nil {
-		fmt.Println("failed to load elf: ", err)
-		os.Exit(1)
 	}
-	prog := bpf.GetProgramByName(nat.typ.String())
-	if prog == nil {
-		fmt.Println("failed to get a xdp program: ", nat.typ.String())
-		os.Exit(1)
-	}
-	ifRedirectMap := bpf.GetMapByName("if_redirect")
-	if ifRedirectMap == nil {
-		fmt.Println("failed to get a bpf map: if_redirect")
-	}
-	ifIndexMap := bpf.GetMapByName("ifindex_map")
-	if ifIndexMap == nil {
-		fmt.Println("failed to get a bpf map: ifindex_map")
-		os.Exit(1)
-	}
-	ifAddrMap := bpf.GetMapByName("ifaddr_map")
-	if ifAddrMap == nil {
-		fmt.Println("failed to get a bpf map: ifaddr_map")
-		os.Exit(1)
-	}
-	ifMacMap := bpf.GetMapByName("if_mac_map")
-	if ifMacMap == nil {
-		fmt.Println("failed to get a bpf map: if_mac_map")
-		os.Exit(1)
-	}
-	if err := prog.Load(); err != nil {
-		fmt.Println("failed to laod xdp program: ", err)
-		os.Exit(1)
-	}
-	if err := nat.attachXdp(prog, ifRedirectMap, ifIndexMap, ifAddrMap, ifMacMap); err != nil {
-		fmt.Println("failed to attachXdp: ", err)
-		os.Exit(1)
-	}
-	defer prog.Detach()
 
 	for {}
 }

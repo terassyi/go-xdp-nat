@@ -2,110 +2,67 @@ package main
 
 import (
 	"fmt"
-	"net"
 
 	"github.com/vishvananda/netlink"
-	"github.com/dropbox/goebpf"
 )
 
-type Nat struct {
-	typ NatType
-	in netlink.Link
-	out netlink.Link
-	inAddr net.IP
-	outAddr net.IP
-	local net.IP
+type Nat interface {
+	Type() NatType
+	Attach() error
+	Prepare() error
+	Run() error
+	Detach() error
+}
+
+type NatMap interface {
+	Type() NatType
 }
 
 type NatType int
 
 const (
-	ICMP_ONLY NatType = iota
-
-	INVALID NatType = iota
+	STATIC NatType = iota
+	DYNAMIC NatType = iota
+	NAPT NatType = iota
+	UNKNOWN NatType = -1
 )
 
-func newNat(typ NatType, in, out, inAddr, outAddr, local string) (*Nat, error) {
-	inL, err := netlink.LinkByName(in)
-	if err != nil {
-		return nil, err
-	}
-	outL, err := netlink.LinkByName(out)
-	if err != nil {
-		return nil, err
-	}
-	return &Nat {
-		typ: typ,
-		in: inL,
-		out: outL,
-		inAddr: net.ParseIP(inAddr),
-		outAddr: net.ParseIP(outAddr),
-		local : net.ParseIP(local),
-	}, nil
-}
+const (
+	NAT_PROG_NAME string = "nat_prog"
+)
 
-func (n *Nat) attachXdp(prog goebpf.Program, ifRedirectMap, ifInfoMap, ifAddrMap, ifMacMap goebpf.Map) error {
-	// in
-	if err := prog.Attach(&goebpf.XdpAttachParams{
-		Interface: n.in.Attrs().Name,
-		Mode: goebpf.XdpAttachModeSkb,
-	}); err != nil {
-		return err
+func NewNatType(typ string) NatType {
+	switch typ {
+	case STATIC.String():
+		return STATIC
+	case DYNAMIC.String():
+		return DYNAMIC
+	case NAPT.String():
+		return NAPT
+	default:
+		return UNKNOWN
 	}
-	if err := ifRedirectMap.Upsert(n.in.Attrs().Index, n.in.Attrs().Index); err != nil {
-// 	if err := ifRedirectMap.Insert(1, 1); err != nil {
-		return err
-	}
-	if err := ifInfoMap.Insert(uint32(0), uint32(n.in.Attrs().Index)); err != nil {
-		return err
-	}
-	if err := ifAddrMap.Insert(uint32(n.in.Attrs().Index), ipv4ToUint32Little(n.inAddr)); err != nil {
-		return err
-	}
-	if err := ifMacMap.Insert(uint32(n.in.Attrs().Index), []byte(n.in.Attrs().HardwareAddr)); err != nil {
-		return err
-	}
-	// out
-	if err := prog.Attach(&goebpf.XdpAttachParams{
-		Interface: n.out.Attrs().Name,
-		Mode: goebpf.XdpAttachModeSkb,
-	}); err != nil {
-		return err
-	}
-	if err := ifRedirectMap.Upsert(n.out.Attrs().Index, n.out.Attrs().Index); err != nil {
-		return err
-	}
-	if err := ifInfoMap.Insert(uint32(1), uint32(n.out.Attrs().Index)); err != nil {
-		return err
-	}
-	if err := ifAddrMap.Insert(uint32(n.out.Attrs().Index), ipv4ToUint32Big(n.outAddr)); err != nil {
-		return err
-	}
-	if err := ifMacMap.Insert(uint32(n.out.Attrs().Index), []byte(n.out.Attrs().HardwareAddr)); err != nil {
-		return err
-	}
-	if err := ifAddrMap.Upsert(uint32(0), ipv4ToUint32Big(n.local)); err != nil {
-		fmt.Println("hogehoge")
-		return err
-	}
-	return nil
-}
 
-func (nt NatType) String() string {
-	switch nt {
-	case ICMP_ONLY:
-		return "icmp_only"
+}
+func (t NatType) String() string {
+	switch t {
+	case STATIC:
+		return "static"
+	case DYNAMIC:
+		return "dynamic"
+	case NAPT:
+		return "napt"
 	default:
 		return ""
 	}
 }
 
-func NewNatType(typ string) (NatType, error) {
+func New(typ NatType, natMap NatMap) (Nat, error) {
 	switch typ {
-	case ICMP_ONLY.String():
-		return ICMP_ONLY, nil
+	case STATIC:
+		return newStaticNat(natMap.(staticNatMap))
 	default:
-		return INVALID, fmt.Errorf("invalid NAT type.")
+		return nil, fmt.Errorf("invalid NAT type")
 	}
 }
 
