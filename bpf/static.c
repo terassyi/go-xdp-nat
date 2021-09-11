@@ -72,6 +72,77 @@ static inline __u16 checksum(__u16 *buf, __u32 bufsize) {
 	return ~sum;
 }
 
+static inline __u16 checksum2(__u8 *data1, int len1, __u8 *data2, int len2) {
+	__u32 sum = 0;
+	__u16 *ptr;
+	int c;
+
+	ptr = (__u16 *)data1;
+
+	for (c = len1; c > 1; c -= 2) {
+		sum += (*ptr);
+		if (sum & 0x80000000) {
+			sum = (sum & 0xffff) + (sum >> 16);
+		}
+		ptr++;
+	}
+
+	if (c == 1) {
+		__u16 val;
+		val = ((*ptr) << 8) + (*data2);
+		sum += val;
+		if (sum & 0x80000000) {
+			sum = (sum & 0xffff) + (sum >> 16);
+		}
+		ptr = (__u16 *)(data2 + 1);
+		len2--;
+	} else {
+		ptr = (__u16 *)data2;
+	}
+
+	for (c = len2; c > 1; c -= 2) {
+		sum += (*ptr);
+		if (sum & 0x80000000) {
+			sum = (sum & 0xffff) + (sum >> 16);
+		}
+		ptr++;
+	}
+
+	if (c == 1) {
+		__u16 val = 0;
+		memcpy(&val, ptr, sizeof(__u8));
+		sum += val;
+	}
+
+	while (sum >> 16) {
+		sum = (sum & 0xffff) + (sum >> 16);
+	}
+
+	return ~sum;
+}
+
+static inline __u16 pseudo_checksum(struct iphdr *ip, __u8 *data, int len) {
+	struct pseudohdr pseudo;
+	__u16 sum;
+	__builtin_memset(&pseudo, 0, sizeof(pseudo));
+	pseudo.source = ip->saddr;
+	pseudo.dest = ip->daddr;
+	pseudo.protocol = ip->protocol;
+	pseudo.len = htons(len);
+	bpf_printk("pseudo ip len %d", htons(len));
+
+	sum = checksum2((__u8 *)&pseudo, sizeof(pseudo), data, len);
+	if (sum == 0 || sum == 0xffff) {
+		return 1;
+	} else {
+		return sum;
+	}
+}
+
+// prototype decl
+__u16 register_nat_table(__u16 *val);
+__u16 lookup_nat_table(__u16 val);
+
 SEC("xdp")
 int nat_prog(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;
@@ -218,22 +289,64 @@ int nat_prog(struct xdp_md *ctx) {
 			if (data + sizeof(*tcp) > data_end) {
 				return XDP_PASS;
 			}
-			struct pseudohdr pseudo;
-			pseudo.source = ip->saddr;
-			pseudo.dest = ip->daddr;
-			pseudo.protocol = 0x06;
-			pseudo.len = ip->tot_len - (ip->ihl * 4);
+			// update nat table
+			__u16 source_port = tcp->src;
+			__u16 *exist = bpf_map_lookup_elem(&nat_table, &source_port);
+			if (!exist) {
+				if (bpf_map_update_elem(&nat_table, &source_port, &source_port, 0) != 0) {
+					bpf_printk("failed: bpf_map_update_elem(): tcp inbound");
+					return XDP_PASS;
+				}
+				bpf_printk("tcp port registere %d", source_port);
+			} else {
+				bpf_printk("tcp port(%d) is already registered.", source_port);
+			}
+
+			// rewrite ip checksum
+			ip->saddr = *out_addr;
+			ip->check = 0;
+			ip->check = checksum((__u16 *)ip, sizeof(*ip));
+
+			// rewrite tcp checksum
+			tcp->check = 0;
+
+			memcpy(ether->h_dest, fib_params.dmac, ETH_ALEN);
+			memcpy(ether->h_source, fib_params.smac, ETH_ALEN);
+
+			return bpf_redirect_map(&if_redirect, *out_ifindex, 0);
+			
 		} else if (ip->protocol == 0x11) {
 			// udp 
 			struct udphdr *udp = data;
 			if (data + sizeof(*udp) > data_end) {
 				return XDP_PASS;
 			}
-			struct pseudohdr pseudo;
-			pseudo.source = ip->saddr;
-			pseudo.dest = ip->daddr;
-			pseudo.protocol = 0x11;
-			pseudo.len = ip->tot_len - (ip->ihl * 4);
+			// update nat table
+			__u16 source_port = udp->source;
+			__u16 *exist = bpf_map_lookup_elem(&nat_table, &source_port);
+			if (!exist) {
+				if (bpf_map_update_elem(&nat_table, &source_port, &source_port, 0) != 0) {
+					bpf_printk("failed: bpf_map_update_elem(): udp inbound");
+					return XDP_PASS;
+				}
+				bpf_printk("udp port registere %d", source_port);
+			} else {
+				bpf_printk("udp port(%d) is already registered.", source_port);
+			}
+
+			// rewrite ip checksum
+			ip->saddr = *out_addr;
+			ip->check = 0;
+			ip->check = checksum((__u16 *)ip, sizeof(*ip));
+
+			// rewrite udp checksum
+			udp->check = 0;
+
+			memcpy(ether->h_dest, fib_params.dmac, ETH_ALEN);
+			memcpy(ether->h_source, fib_params.smac, ETH_ALEN);
+
+			return bpf_redirect_map(&if_redirect, *out_ifindex, 0);
+
 		}
 	} else if (ingress_ifindex == *out_ifindex) {
 
@@ -293,12 +406,37 @@ int nat_prog(struct xdp_md *ctx) {
 			if (data + sizeof(*tcp) > data_end) {
 				return XDP_PASS;
 			}
-			struct pseudohdr pseudo;
-			pseudo.source = ip->saddr;
-			pseudo.dest = ip->daddr;
-			pseudo.protocol = 0x06;
-			pseudo.len = ip->tot_len - (ip->ihl * 4);
-			pseudo.zero = 0;
+			__u16 source_port = tcp->dst;
+			__u16 *registered_port = bpf_map_lookup_elem(&nat_table, &source_port);
+			if (!registered_port) {
+				bpf_printk("tcp port is not registered.(%d)", *registered_port);
+				return XDP_PASS;
+			}
+			bpf_printk("tcp port is registered %d (outbound)", *registered_port);
+
+			ip->daddr = *mapped_local_addr;
+			ip->check = 0;
+			ip->check = checksum((__u16 *)ip, sizeof(*ip));
+
+			struct bpf_fib_lookup fib_params;
+			__builtin_memset(&fib_params, 0, sizeof(fib_params));
+			fib_params.family = AF_INET;
+			fib_params.ipv4_src = ip->saddr;
+			fib_params.ipv4_dst = ip->daddr;
+			fib_params.ifindex = ingress_ifindex;
+			int rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), 0);
+			if ((rc != BPF_FIB_LKUP_RET_SUCCESS) && (rc != BPF_FIB_LKUP_RET_NO_NEIGH)) {
+				bpf_printk("dropping packet\n");
+				return XDP_DROP;
+			} else if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
+				bpf_printk("passing packet, lookup returned %d\n", BPF_FIB_LKUP_RET_NO_NEIGH);
+				return XDP_PASS;
+			}
+
+			memcpy(ether->h_dest, fib_params.dmac, ETH_ALEN);
+			memcpy(ether->h_source, fib_params.smac, ETH_ALEN);
+			
+			return bpf_redirect_map(&if_redirect, *in_ifindex, 0);
 
 		} else if (ip->protocol == 0x11) {
 			// udp 
@@ -306,12 +444,39 @@ int nat_prog(struct xdp_md *ctx) {
 			if (data + sizeof(*udp) > data_end) {
 				return XDP_PASS;
 			}
-			struct pseudohdr pseudo;
-			pseudo.source = ip->saddr;
-			pseudo.dest = ip->daddr;
-			pseudo.protocol = 0x11;
-			pseudo.len = ip->tot_len - (ip->ihl * 4);
-			pseudo.zero = 0;
+
+			__u16 source_port = udp->dest;
+			__u16 *registered_port = bpf_map_lookup_elem(&nat_table, &source_port);
+			if (!registered_port) {
+				bpf_printk("tcp port is not registered.(%d)", *registered_port);
+				return XDP_PASS;
+			}
+			bpf_printk("tcp port is registered %d (outbound)", *registered_port);
+
+			ip->daddr = *mapped_local_addr;
+			ip->check = 0;
+			ip->check = checksum((__u16 *)ip, sizeof(*ip));
+
+			struct bpf_fib_lookup fib_params;
+			__builtin_memset(&fib_params, 0, sizeof(fib_params));
+			fib_params.family = AF_INET;
+			fib_params.ipv4_src = ip->saddr;
+			fib_params.ipv4_dst = ip->daddr;
+			fib_params.ifindex = ingress_ifindex;
+			int rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), 0);
+			if ((rc != BPF_FIB_LKUP_RET_SUCCESS) && (rc != BPF_FIB_LKUP_RET_NO_NEIGH)) {
+				bpf_printk("dropping packet\n");
+				return XDP_DROP;
+			} else if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
+				bpf_printk("passing packet, lookup returned %d\n", BPF_FIB_LKUP_RET_NO_NEIGH);
+				return XDP_PASS;
+			}
+
+			memcpy(ether->h_dest, fib_params.dmac, ETH_ALEN);
+			memcpy(ether->h_source, fib_params.smac, ETH_ALEN);
+			
+			return bpf_redirect_map(&if_redirect, *in_ifindex, 0);
+
 		} else {
 			return XDP_PASS;
 		}
@@ -319,6 +484,24 @@ int nat_prog(struct xdp_md *ctx) {
 		return XDP_PASS;
 	}
 	return XDP_PASS;
+}
+
+// if success, return 0
+__u16 register_nat_table(__u16 *val) {
+	__u16 *exist = bpf_map_lookup_elem(&nat_table, val);
+	if (!exist) {
+		return *exist;
+	}
+	return bpf_map_update_elem(&nat_table, val, val, 0);
+}
+
+__u16 lookup_nat_table(__u16 val) {
+	bpf_printk("%d", val);
+	__u16 *res = bpf_map_lookup_elem(&nat_table, &val);
+	if (!res) {
+		return 0;
+	}
+	return *res;
 }
 
 char _license[] SEC("license") = "GPL";
